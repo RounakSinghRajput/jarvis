@@ -1,106 +1,135 @@
 import logging
-import re
-import time
+import signal
+import sys
+import threading
+
+from pynput import keyboard
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtWidgets import QApplication
 
 from agent.providers import get_llm_provider
+from app.assistant import Assistant
 from audio.recorder import MicRecorder
 from audio.stt import get_stt_provider
 from audio.tts import get_tts_provider
 from config.settings import settings
+from ui.window import JarvisWindow
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("jarvis")
 
 SYSTEM_PROMPT = (
     "You are JARVIS, a helpful personal assistant. "
-    "Always reply in simple Hindi written in Devanagari script. "
+    "Always reply in clear, simple hindi, even if the user's text looks like another language. "
     "Keep answers to one or two short sentences, since they will be spoken aloud. "
     "Do not use markdown, bullet points, or emojis."
 )
 
-# A sentence ends at . ! ? or the Hindi danda followed by whitespace.
-SENTENCE_END = re.compile(r"(?<=[.!?।])\s+")
-MIN_CHUNK_CHARS = 40  # join very short sentences so speech doesn't sound chopped
+
+class Bridge(QObject):
+    """Qt signals let the assistant thread talk to the UI thread safely."""
+
+    state_changed = Signal(str)
+    text_event = Signal(str, str)
+    quit_requested = Signal()
+
+
+def console_input(assistant: Assistant) -> None:
+    """Typed fallback. Empty Enter works like the hotkey."""
+    while True:
+        try:
+            line = input().strip()
+        except EOFError:
+            break
+        if line.lower() in {"quit", "exit"}:
+            assistant.shutdown()
+            break
+        if line:
+            assistant.submit_text(line)
+        else:
+            assistant.on_hotkey()
 
 
 def main() -> None:
-    llm = get_llm_provider()
-    tts = get_tts_provider()
-    stt = get_stt_provider()
-    recorder = MicRecorder(
-        silence_threshold=settings.mic_threshold,
-        silence_seconds=settings.mic_silence_seconds,
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # the orb hides itself; the app keeps running
+
+    assistant = Assistant(
+        llm=get_llm_provider(),
+        tts=get_tts_provider(),
+        stt=get_stt_provider(),
+        recorder=MicRecorder(
+            silence_threshold=settings.mic_threshold,
+            silence_seconds=settings.mic_silence_seconds,
+        ),
+        system_prompt=SYSTEM_PROMPT,
     )
-    history: list[dict[str, str]] = []
+
+    # --- connect assistant <-> window ---
+    window = JarvisWindow()
+    bridge = Bridge()
+
+    def on_state(state) -> None:
+        logger.info("UI <- state %s", state.value)
+        bridge.state_changed.emit(state.value)
+
+    def on_event(kind: str, text: str) -> None:
+        bridge.text_event.emit(kind, text)
+
+    assistant.add_state_listener(on_state)
+    assistant.add_event_listener(on_event)
+
+    # QueuedConnection forces window updates to run on the main (UI) thread.
+    queued = Qt.ConnectionType.QueuedConnection
+    bridge.state_changed.connect(window.on_state, queued)
+    bridge.text_event.connect(window.on_text, queued)
+    bridge.quit_requested.connect(app.quit, queued)
+    window.stop_clicked.connect(assistant.emergency_stop)
+
+    # Startup self-test: the orb flashes for about 2 seconds when the app starts.
+    # If you never see it, the problem is the window/display, not the assistant.
+    # (Delete these two lines once everything works.)
+    QTimer.singleShot(300, lambda: window.on_state("listening"))
+    QTimer.singleShot(2500, lambda: window.on_state("idle"))
+
+    # --- hotkey and typed input ---
+    hotkey = keyboard.GlobalHotKeys({settings.hotkey: assistant.on_hotkey})
+    hotkey.start()
+    threading.Thread(target=console_input, args=(assistant,), daemon=True).start()
+
+    # --- Ctrl+C: Qt blocks Python, so a timer gives Python a chance to see it ---
+    signal.signal(signal.SIGINT, lambda *_: assistant.shutdown())
+    tick = QTimer()
+    tick.timeout.connect(lambda: None)
+    tick.start(250)
+
+    # --- the assistant loop runs in the background; Qt owns the main thread ---
+    def run_assistant() -> None:
+        try:
+            assistant.run()
+        finally:
+            bridge.quit_requested.emit()
+
+    threading.Thread(target=run_assistant, daemon=True).start()
+
     logger.info("Using LLM model: %s", settings.llm_model)
-    logger.info("JARVIS ready. Enter = bolo (bolne ke baad phir Enter), ya type karo.")
-
+    print(
+        f"\nJARVIS ready.\n"
+        f"  Hotkey {settings.hotkey}\n"
+        f"    - when idle      : start a conversation (keeps listening)\n"
+        f"    - while listening: end the conversation\n"
+        f"    - while speaking : cancel the current reply\n"
+        f"  Say 'ok bye'               -> end the conversation\n"
+        f"  Click the orb              -> stop everything\n"
+        f"  Enter on an empty line     -> same as the hotkey\n"
+        f"  Type a message + Enter     -> text input (single turn)\n"
+        f"  'quit' + Enter             -> exit\n"
+    )
     try:
-        while True:
-            typed = input("\n[Enter = bolo, ya type karo]: ").strip()
-            if typed.lower() in {"quit", "exit"}:
-                break
-
-            t_start = time.perf_counter()
-            if typed:
-                user_text = typed
-            else:
-                print("Listening... bolo")
-                audio = recorder.record()
-                t_rec = time.perf_counter()
-                user_text = stt.transcribe(audio)
-                t_stt = time.perf_counter()
-                logger.info(
-                    "TIMING record=%.1fs (audio %.1fs) | whisper=%.1fs",
-                    t_rec - t_start, len(audio) / 16000, t_stt - t_rec,
-                )
-                if not user_text:
-                    print("Kuch sunai nahi diya, dobara try karo.")
-                    continue
-                print(f"You said: {user_text}")
-
-            t_llm_start = time.perf_counter()
-            history.append({"role": "user", "content": user_text})
-            full_reply = ""
-            buffer = ""     # text still arriving from the LLM
-            pending = ""    # complete sentences waiting to be sent to TTS
-            first_token = True
-            first_audio = True
-            print("JARVIS: ", end="", flush=True)
-
-            for piece in llm.stream(history, system=SYSTEM_PROMPT):
-                if first_token:
-                    logger.info("TIMING llm first token=%.1fs", time.perf_counter() - t_llm_start)
-                    first_token = False
-                print(piece, end="", flush=True)
-                full_reply += piece
-                buffer += piece
-
-                parts = SENTENCE_END.split(buffer)
-                for sentence in parts[:-1]:
-                    pending += sentence + " "
-                    if len(pending) >= MIN_CHUNK_CHARS:
-                        if first_audio:
-                            logger.info(
-                                "TIMING first chunk queued=%.1fs",
-                                time.perf_counter() - t_llm_start,
-                            )
-                            first_audio = False
-                        tts.enqueue(pending)
-                        pending = ""
-                buffer = parts[-1]
-
-            # Send whatever is left, then wait for speech to finish.
-            leftover = (pending + buffer).strip()
-            if leftover:
-                tts.enqueue(leftover)
-            print()
-            tts.wait()
-            history.append({"role": "assistant", "content": full_reply})
-    except KeyboardInterrupt:
-        pass
+        app.exec()
     finally:
-        tts.stop()
+        assistant.shutdown()
+        hotkey.stop()
 
 
 if __name__ == "__main__":
