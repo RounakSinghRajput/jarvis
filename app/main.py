@@ -3,6 +3,7 @@ import signal
 import sys
 import threading
 
+from tools import build_registry
 from pynput import keyboard
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import QApplication
@@ -19,10 +20,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("jarvis")
 
 SYSTEM_PROMPT = (
-    "You are JARVIS, a helpful personal assistant. "
-    "Always reply in clear, simple hindi, even if the user's text looks like another language. "
+    "You are JARVIS, a helpful personal assistant running on the user's Mac. "
+    "Always reply in clear, simple English, even if the user's text looks like another language. "
     "Keep answers to one or two short sentences, since they will be spoken aloud. "
-    "Do not use markdown, bullet points, or emojis."
+    "Do not use markdown, bullet points, or emojis. "
+    "You have tools that control the Mac. Use a tool whenever the user asks for an action. "
+    "Never say you did something unless the tool result says it worked. "
+    "If a tool fails or is not allowed, say so plainly."
 )
 
 
@@ -55,7 +59,7 @@ def main() -> None:
     app.setQuitOnLastWindowClosed(False)  # the orb hides itself; the app keeps running
 
     assistant = Assistant(
-        llm=get_llm_provider(),
+        llm=get_llm_provider(build_registry()),
         tts=get_tts_provider(),
         stt=get_stt_provider(),
         recorder=MicRecorder(

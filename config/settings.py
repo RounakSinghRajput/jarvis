@@ -22,7 +22,7 @@ class Settings:
     mic_threshold: float = float(os.getenv("MIC_THRESHOLD", "0.01"))
     mic_silence_seconds: float = float(os.getenv("MIC_SILENCE_SECONDS", "1.0"))
     hotkey: str = os.getenv("HOTKEY", "<ctrl>+<shift>+j")
-
+    allow_medium_risk: bool = os.getenv("ALLOW_MEDIUM_RISK", "true").lower() == "true"
 
 
 settings = Settings()
